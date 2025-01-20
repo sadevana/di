@@ -101,7 +101,7 @@ func NewProvider(depProviders ...any) (*Provider, error) {
 		return nil, fmt.Errorf("all deps must be provided: %w", err)
 	}
 
-	if err := noCyclicDependencies(allProvidedTypes); err != nil {
+	if err := checkForCyclicDependencies(allProvidedTypes); err != nil {
 		return nil, fmt.Errorf("should not have cyclic dependencies: %w", err)
 	}
 
@@ -184,7 +184,7 @@ func allSubDepsProvided(allProvidedTypes map[reflect.Type]providerInfo) error {
 	return nil
 }
 
-func noCyclicDependencies(allProvidedTypes map[reflect.Type]providerInfo) error {
+func checkForCyclicDependencies(allProvidedTypes map[reflect.Type]providerInfo) error {
 	for providerType, provider := range allProvidedTypes {
 		providerDeps := provider.deps
 		for otherProviderType, otherProvider := range allProvidedTypes {
@@ -194,7 +194,7 @@ func noCyclicDependencies(allProvidedTypes map[reflect.Type]providerInfo) error 
 			otherDepsContainsProvider := slices.Contains(otherProvider.deps, providerType)
 			providerDepsContainsOther := slices.Contains(providerDeps, otherProviderType)
 			if otherDepsContainsProvider && providerDepsContainsOther {
-				return fmt.Errorf("cyclic dependency found between %s and %s", provider.providerName, otherProvider.providerName)
+				return fmt.Errorf("cyclic dependency found between providers %s and %s", provider.providerName, otherProvider.providerName)
 			}
 		}
 	}
@@ -210,11 +210,21 @@ func (c *Provider) Provide(dst any) error {
 	for i := 0; i < dstValue.NumField(); i++ {
 		field := dstValue.Field(i)
 		fieldType := dstType.Elem().Field(i)
-		fieldValue, err := c.resolve(fieldType.Type)
-		if err != nil {
-			return fmt.Errorf("failed to resolve field %s: %w", fieldType.Name, err)
+		diTag := fieldType.Tag.Get("di")
+		switch diTag {
+		case "group":
+			if err := c.resolveGroup(field, fieldType); err != nil {
+				return fmt.Errorf("failed to resolve group %s: %w", fieldType.Name, err)
+			}
+		case "-":
+			continue
+		default:
+			fieldValue, err := c.resolve(fieldType.Type)
+			if err != nil {
+				return fmt.Errorf("failed to resolve field %s: %w", fieldType.Name, err)
+			}
+			field.Set(fieldValue)
 		}
-		field.Set(fieldValue)
 	}
 
 	return nil
@@ -249,4 +259,20 @@ func (c *Provider) resolve(fieldType reflect.Type) (reflect.Value, error) {
 	c.resolvedTypes[fieldType] = resolvedValue
 
 	return resolvedValue, nil
+}
+
+func (c *Provider) resolveGroup(field reflect.Value, fieldType reflect.StructField) error {
+	if field.Kind() != reflect.Struct {
+		return fmt.Errorf("`di:group` can only be used on struct fields, got %s", field.Kind())
+	}
+	if !field.CanInterface() {
+		return fmt.Errorf("`di:group` can only be used on exported struct fields, got %s", fieldType.Name)
+	}
+	if !field.CanAddr() {
+		return fmt.Errorf("`di:group` can only be used on addressable struct fields, got %s", fieldType.Name)
+	}
+	if err := c.Provide(field.Addr().Interface()); err != nil {
+		return fmt.Errorf("failed to provide group %s: %w", fieldType.Name, err)
+	}
+	return nil
 }
